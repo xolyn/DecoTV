@@ -157,6 +157,22 @@ docker pull ghcr.io/decohererk/decotv:v0.9.0
 
 > **注意**：使用 `latest` 标签时，重启容器不会自动拉取新镜像，需要手动执行 `docker pull` 才能获取更新。使用版本号标签可以明确控制何时更新。
 
+### 访问协议与反向代理
+
+DecoTV 支持直接通过 Docker 端口映射在局域网 HTTP 地址访问，例如 `http://192.168.1.10:3000`。这种场景下登录 Cookie 不会设置 `Secure` 属性，浏览器可以正常保存认证状态。
+
+公网部署强烈建议使用 HTTPS。若前面有 Nginx/OpenResty 等反向代理，请确保把外部访问协议传给 DecoTV：
+
+```nginx
+proxy_set_header Host $http_host;
+proxy_set_header X-Forwarded-Host $http_host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+DecoTV 会根据请求 URL、`X-Forwarded-Proto`、`X-Forwarded-Host` 或标准 `Forwarded` 头判断实际协议和外部访问域名。使用 `https://域名:非443端口` 反代时，务必传递带端口的 `$http_host`，否则浏览器后续请求 m3u8 代理地址时会丢端口。HTTPS 访问会设置 `Secure` Cookie；HTTP 局域网直连和 HTTP 反代不会设置 `Secure` Cookie。不要仅依赖容器内的 `NODE_ENV=production` 判断访问协议。
+
 ### Kvrocks 存储（推荐）
 
 ```yml
@@ -331,7 +347,8 @@ volumes:
 
 1. **浏览器 Cookie 问题**：尝试清除浏览器 Cookie 后重新登录
 2. **残留数据库配置**：确保没有设置 `REDIS_URL`、`KV_REST_API_URL` 等数据库变量
-3. **使用了 HTTPS 代理**：如果你通过 Nginx 等反向代理使用 HTTPS，确保正确配置了 `X-Forwarded-Proto` 头
+3. **反向代理协议头缺失**：如果你通过 Nginx/OpenResty 等反向代理使用 HTTPS，确保正确配置 `X-Forwarded-Proto $scheme`，否则应用可能无法按外部访问协议设置 Cookie
+4. **镜像未更新**：`latest` 镜像重启不会自动拉取新版本，升级前需要先执行 `docker pull ghcr.io/decohererk/decotv:latest`
 
 **Q: 如何从本地模式迁移到数据库模式？**
 
@@ -531,7 +548,7 @@ DecoTV 的网盘搜索采用远程 PanSou 节点转发模式。推荐先部署 [
 
 1. 部署 PanSou 服务并确保 `https://your-pansou-domain/api/health` 可访问。
 2. 进入 DecoTV 后台 `PanSou 配置` 页面。
-3. 填写服务地址（例如 `https://your-pansou-domain`），按需填写 `API Token / 鉴权密钥`。
+3. 填写服务地址（例如 `https://your-pansou-domain`）。如果 PanSou 开启 `AUTH_ENABLED=true`，可以直接填写 PanSou 用户名/密码，DecoTV 会自动登录换取 JWT；也可以在 `API Token / 鉴权密钥` 中直接填 JWT，支持填 `Bearer xxx` 或裸 token。
 4. 先执行连通性测试，再保存配置即可生效。
 
 ### TMDB 元数据增强配置

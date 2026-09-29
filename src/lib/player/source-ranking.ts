@@ -34,6 +34,28 @@ export function isVerifiedPlaybackResult(
   );
 }
 
+export function isPlayableFallbackResult(
+  result: VideoSourceTestResult | undefined,
+): boolean {
+  if (!result || result.hasError || result.mediaType === 'page') return false;
+  if (isVerifiedPlaybackResult(result)) return true;
+  if (result.status !== 'partial') return false;
+  if (
+    result.failureKind === 'resolver' ||
+    result.failureKind === 'timeout' ||
+    result.failureKind === 'manifest' ||
+    result.failureKind === 'network'
+  ) {
+    return false;
+  }
+
+  return Boolean(
+    result.playable ||
+    result.failureKind === 'fragment' ||
+    (result.pingTime || 0) > 0,
+  );
+}
+
 export function getPlaybackEvidenceTier(
   result: VideoSourceTestResult | undefined,
 ): number {

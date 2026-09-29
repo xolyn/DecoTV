@@ -161,6 +161,7 @@ function isPublicModeAllowedPath(pathname: string): boolean {
     '/api/proxy',
     '/api/live',
     '/api/pansou',
+    '/api/playback',
     '/api/tmdb',
     '/api/private-library',
     '/api/source-browser',
@@ -251,6 +252,9 @@ function shouldSkipAuth(pathname: string): boolean {
     '/screenshot.png',
     '/api/tvbox/config',
     '/api/tvbox/diagnose',
+    '/api/tvbox/douban',
+    '/api/tvbox/search',
+    '/api/proxy/spider.jar',
     '/api/proxy/m3u8-filter',
     '/api/proxy/m3u8-asset',
     '/register', // 允许访问注册页面
@@ -292,6 +296,6 @@ function shouldSkipAuth(pathname: string): boolean {
 // 配置 proxy 匹配规则
 export const config = {
   matcher: [
-    '/((?!_next/static|_next/image|favicon.ico|login|warning|api/login|api/register|api/logout|api/cron|api/server-config|api/version|VERSION.txt).*)',
+    '/((?!_next/static|_next/image|favicon.ico|login|warning|api/login|api/register|api/logout|api/cron|api/server-config|api/version|VERSION.txt|version.json).*)',
   ],
 };

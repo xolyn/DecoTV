@@ -11,12 +11,11 @@ import React, {
 import {
   comparePlaybackMetrics,
   getPlaybackEvidenceTier,
+  hasMeasuredMediaThroughput,
+  isVerifiedPlaybackResult,
 } from '@/lib/player/source-ranking';
 import { SearchResult } from '@/lib/types';
-import {
-  getVideoResolutionFromM3u8,
-  type VideoSourceTestResult,
-} from '@/lib/utils';
+import { type VideoSourceTestResult } from '@/lib/utils';
 
 import ExternalImage from '@/components/ExternalImage';
 
@@ -81,9 +80,7 @@ function compareLatencySourceOrder(a: SourceSortItem, b: SourceSortItem) {
 
 function formatResponseTime(ms: number) {
   if (!Number.isFinite(ms) || ms <= 0) return '未测得';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 10000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.round(ms / 1000)}s`;
+  return `${Math.round(ms)}ms`;
 }
 
 function getLatencyTextClassName(pingTime: number) {
@@ -121,8 +118,19 @@ interface EpisodeSelectorProps {
   availableSources?: SearchResult[];
   sourceSearchLoading?: boolean;
   sourceSearchError?: string | null;
-  /** 预计算的测速结果，避免重复测速 */
-  precomputedVideoInfo?: Map<string, VideoInfo>;
+  /** 当前集各播放源的统一测速结果 */
+  sourceVideoInfoMap?: Map<string, VideoInfo>;
+  /** 正在测速的播放源 key */
+  sourceTestingKeys?: Set<string>;
+  /** 自动/手动测速进度 */
+  sourceProbeProgress?: {
+    running: boolean;
+    mode: 'idle' | 'auto' | 'manual';
+    done: number;
+    total: number;
+  };
+  /** 手动重新测速全部源 */
+  onManualSpeedTest?: () => void | Promise<void>;
 }
 
 /**
@@ -141,39 +149,21 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
   availableSources = [],
   sourceSearchLoading = false,
   sourceSearchError = null,
-  precomputedVideoInfo,
+  sourceVideoInfoMap = new Map(),
+  sourceTestingKeys = new Set(),
+  sourceProbeProgress = {
+    running: false,
+    mode: 'idle',
+    done: 0,
+    total: 0,
+  },
+  onManualSpeedTest,
 }) => {
   const router = useRouter();
   const pageCount = Math.ceil(totalEpisodes / episodesPerPage);
 
-  // 存储每个源的视频信息
-  const [videoInfoMap, setVideoInfoMap] = useState<Map<string, VideoInfo>>(
-    new Map(),
-  );
-  const [attemptedSources, setAttemptedSources] = useState<Set<string>>(
-    new Set(),
-  );
-  const [testingSourceKeys, setTestingSourceKeys] = useState<Set<string>>(
-    new Set(),
-  );
-  const [manualTesting, setManualTesting] = useState(false);
-  const [manualProgress, setManualProgress] = useState({ done: 0, total: 0 });
   const [sourceSortMode, setSourceSortMode] =
     useState<SourceSortMode>('default');
-  const [hasManualTested, setHasManualTested] = useState(false);
-
-  // 使用 ref 来避免闭包问题
-  const attemptedSourcesRef = useRef<Set<string>>(new Set());
-  const videoInfoMapRef = useRef<Map<string, VideoInfo>>(new Map());
-
-  // 同步状态到 ref
-  useEffect(() => {
-    attemptedSourcesRef.current = attemptedSources;
-  }, [attemptedSources]);
-
-  useEffect(() => {
-    videoInfoMapRef.current = videoInfoMap;
-  }, [videoInfoMap]);
 
   // 主要的 tab 状态：'episodes' 或 'sources'
   // 当只有一集时默认展示 "换源"，并隐藏 "选集" 标签
@@ -200,183 +190,22 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
     return `${source.source}-${source.id}`;
   }, []);
 
-  const getTestEpisodeUrl = useCallback(
-    (source: SearchResult) => {
-      if (!source.episodes || source.episodes.length === 0) return '';
-      return source.episodes[value - 1] || source.episodes[0];
-    },
-    [value],
-  );
-
   const sourceListSignature = useMemo(
     () => availableSources.map((source) => getSourceKey(source)).join('|'),
     [availableSources, getSourceKey],
   );
-
-  const testScopeRef = useRef({
-    episode: value,
-    sourceListSignature,
-  });
-  const testScopeVersionRef = useRef(0);
+  const autoSortScopeRef = useRef('');
 
   useEffect(() => {
-    const previousScope = testScopeRef.current;
-    if (
-      previousScope.episode === value &&
-      previousScope.sourceListSignature === sourceListSignature
-    ) {
-      return;
-    }
-
-    testScopeRef.current = { episode: value, sourceListSignature };
-    testScopeVersionRef.current += 1;
-    const emptyVideoInfoMap = new Map<string, VideoInfo>();
-    const emptyAttemptedSources = new Set<string>();
-    const emptyTestingSourceKeys = new Set<string>();
-
-    setVideoInfoMap(emptyVideoInfoMap);
-    setAttemptedSources(emptyAttemptedSources);
-    setTestingSourceKeys(emptyTestingSourceKeys);
-    setManualProgress({ done: 0, total: 0 });
     setSourceSortMode('default');
-    setHasManualTested(false);
-    videoInfoMapRef.current = emptyVideoInfoMap;
-    attemptedSourcesRef.current = emptyAttemptedSources;
+    autoSortScopeRef.current = '';
   }, [sourceListSignature, value]);
 
-  // 获取视频信息的函数 - 移除 attemptedSources 依赖避免不必要的重新创建
-  const getVideoInfo = useCallback(
-    async (source: SearchResult, force = false) => {
-      const sourceKey = getSourceKey(source);
-      const requestScopeVersion = testScopeVersionRef.current;
-      const isCurrentTestScope = () =>
-        testScopeVersionRef.current === requestScopeVersion;
-
-      // 使用 ref 获取最新的状态，避免闭包问题
-      if (!force && attemptedSourcesRef.current.has(sourceKey)) {
-        return;
-      }
-
-      const episodeUrl = getTestEpisodeUrl(source);
-
-      // 标记为已尝试
-      setAttemptedSources((prev) => new Set(prev).add(sourceKey));
-      attemptedSourcesRef.current.add(sourceKey);
-      setTestingSourceKeys((prev) => new Set(prev).add(sourceKey));
-
-      if (!episodeUrl) {
-        if (isCurrentTestScope()) {
-          setVideoInfoMap((prev) =>
-            new Map(prev).set(sourceKey, {
-              quality: '未知',
-              loadSpeed: '未知',
-              pingTime: 0,
-              hasError: true,
-              status: 'failed',
-              message: '没有可用播放地址',
-            }),
-          );
-          setTestingSourceKeys((prev) => {
-            const next = new Set(prev);
-            next.delete(sourceKey);
-            return next;
-          });
-        }
-        return;
-      }
-
-      try {
-        const info = await getVideoResolutionFromM3u8(episodeUrl, {
-          timeoutMs: force ? 10000 : 8000,
-        });
-        if (isCurrentTestScope()) {
-          setVideoInfoMap((prev) => new Map(prev).set(sourceKey, info));
-        }
-      } catch (error) {
-        // 失败时保存错误状态
-        if (isCurrentTestScope()) {
-          setVideoInfoMap((prev) =>
-            new Map(prev).set(sourceKey, {
-              quality: '未知',
-              loadSpeed: '未知',
-              pingTime: 0,
-              hasError: true,
-              status: 'failed',
-              message: error instanceof Error ? error.message : '检测失败',
-            }),
-          );
-        }
-      } finally {
-        if (isCurrentTestScope()) {
-          setTestingSourceKeys((prev) => {
-            const next = new Set(prev);
-            next.delete(sourceKey);
-            return next;
-          });
-        }
-      }
-    },
-    [getSourceKey, getTestEpisodeUrl],
-  );
-
   const handleManualSpeedTest = useCallback(async () => {
-    if (availableSources.length === 0 || manualTesting) return;
-
-    const requestScopeVersion = testScopeVersionRef.current;
-    setManualTesting(true);
-    setManualProgress({ done: 0, total: availableSources.length });
-
-    const batchSize = 2;
-    try {
-      for (let start = 0; start < availableSources.length; start += batchSize) {
-        const batch = availableSources.slice(start, start + batchSize);
-        await Promise.all(
-          batch.map(async (source) => {
-            await getVideoInfo(source, true);
-            if (testScopeVersionRef.current === requestScopeVersion) {
-              setManualProgress((prev) => ({
-                done: Math.min(prev.done + 1, prev.total),
-                total: prev.total,
-              }));
-            }
-          }),
-        );
-      }
-    } finally {
-      if (testScopeVersionRef.current === requestScopeVersion) {
-        setSourceSortMode('latency');
-        setHasManualTested(true);
-      }
-      setManualTesting(false);
-    }
-  }, [availableSources, getVideoInfo, manualTesting]);
-
-  // 当有预计算结果时，先合并到videoInfoMap中
-  useEffect(() => {
-    if (precomputedVideoInfo && precomputedVideoInfo.size > 0) {
-      // 原子性地更新两个状态，避免时序问题
-      setVideoInfoMap((prev) => {
-        const newMap = new Map(prev);
-        precomputedVideoInfo.forEach((value, key) => {
-          newMap.set(key, value);
-        });
-        return newMap;
-      });
-
-      setAttemptedSources((prev) => {
-        const newSet = new Set(prev);
-        precomputedVideoInfo.forEach((_info, key) => {
-          newSet.add(key);
-        });
-        return newSet;
-      });
-
-      // 同步更新 ref，确保 getVideoInfo 能立即看到更新
-      precomputedVideoInfo.forEach((_info, key) => {
-        attemptedSourcesRef.current.add(key);
-      });
-    }
-  }, [precomputedVideoInfo]);
+    if (availableSources.length === 0 || sourceProbeProgress.running) return;
+    setSourceSortMode('latency');
+    await onManualSpeedTest?.();
+  }, [availableSources.length, onManualSpeedTest, sourceProbeProgress.running]);
 
   // 升序分页标签
   const categoriesAsc = useMemo(() => {
@@ -525,8 +354,8 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
           isCurrentSource:
             source.source?.toString() === currentSource?.toString() &&
             source.id?.toString() === currentId?.toString(),
-          isTesting: testingSourceKeys.has(sourceKey),
-          videoInfo: videoInfoMap.get(sourceKey),
+          isTesting: sourceTestingKeys.has(sourceKey),
+          videoInfo: sourceVideoInfoMap.get(sourceKey),
         };
       }),
     [
@@ -534,15 +363,15 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
       currentId,
       currentSource,
       getSourceKey,
-      testingSourceKeys,
-      videoInfoMap,
+      sourceTestingKeys,
+      sourceVideoInfoMap,
     ],
   );
 
   const rankedLatencyItems = useMemo(
     () =>
       sourceItems
-        .filter((item) => hasMeasuredResult(item.videoInfo))
+        .filter((item) => isVerifiedPlaybackResult(item.videoInfo))
         .sort(compareLatencyMetrics),
     [sourceItems],
   );
@@ -557,6 +386,17 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
 
   const bestPlaybackItem = rankedLatencyItems[0] || null;
 
+  useEffect(() => {
+    const scopeKey = `${value}|${sourceListSignature}`;
+    if (
+      rankedLatencyItems.length > 0 &&
+      autoSortScopeRef.current !== scopeKey
+    ) {
+      autoSortScopeRef.current = scopeKey;
+      setSourceSortMode('latency');
+    }
+  }, [rankedLatencyItems.length, sourceListSignature, value]);
+
   const testedSourceCount = useMemo(
     () => sourceItems.filter((item) => Boolean(item.videoInfo)).length,
     [sourceItems],
@@ -564,6 +404,38 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
 
   const failedSourceCount = useMemo(
     () => sourceItems.filter((item) => item.videoInfo?.hasError).length,
+    [sourceItems],
+  );
+
+  const connectedSourceCount = useMemo(
+    () =>
+      sourceItems.filter(
+        (item) =>
+          item.videoInfo &&
+          !item.videoInfo.hasError &&
+          item.videoInfo.failureKind !== 'resolver' &&
+          item.videoInfo.failureKind !== 'timeout' &&
+          !(
+            item.videoInfo.failureKind === 'manifest' &&
+            !item.videoInfo.playable
+          ) &&
+          (item.videoInfo.status === 'partial' || item.videoInfo.pingTime > 0),
+      ).length,
+    [sourceItems],
+  );
+
+  const pendingSourceCount = useMemo(
+    () =>
+      sourceItems.filter(
+        (item) =>
+          item.videoInfo &&
+          !item.videoInfo.hasError &&
+          item.videoInfo.status === 'partial' &&
+          (item.videoInfo.failureKind === 'resolver' ||
+            item.videoInfo.failureKind === 'timeout' ||
+            (item.videoInfo.failureKind === 'manifest' &&
+              !item.videoInfo.playable)),
+      ).length,
     [sourceItems],
   );
 
@@ -578,36 +450,49 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
   }, [sourceItems, sourceSortMode]);
 
   const sourceSortStatusText = (() => {
-    if (manualTesting) {
-      return `测速中 ${manualProgress.done}/${manualProgress.total}`;
+    if (sourceProbeProgress.running) {
+      const label =
+        sourceProbeProgress.mode === 'manual' ? '手动测速中' : '自动测速中';
+      return `${label} ${sourceProbeProgress.done}/${sourceProbeProgress.total}`;
     }
 
     if (sourceSortMode === 'latency') {
       if (bestPlaybackItem?.videoInfo) {
         const startupText =
           typeof bestPlaybackItem.videoInfo.startupTimeMs === 'number'
-            ? `首片 ${formatResponseTime(
+            ? `延迟 ${formatResponseTime(
                 bestPlaybackItem.videoInfo.startupTimeMs,
               )}`
-            : `仅响应 ${formatResponseTime(
-                bestPlaybackItem.videoInfo.pingTime,
-              )}`;
+            : `响应 ${formatResponseTime(bestPlaybackItem.videoInfo.pingTime)}`;
         const speedText =
           bestPlaybackItem.videoInfo.loadSpeed !== '未知'
             ? ` · 速度 ${bestPlaybackItem.videoInfo.loadSpeed}`
             : '';
-        return `最佳首播 ${startupText}${speedText} · ${bestPlaybackItem.source.source_name}`;
+        return `最佳播放源 ${startupText}${speedText} · ${bestPlaybackItem.source.source_name}`;
       }
+      if (connectedSourceCount > 0) {
+        return failedSourceCount > 0
+          ? `已连通 ${connectedSourceCount} 个源，部分源未完成分片测速`
+          : `已连通 ${connectedSourceCount} 个源，等待分片测速`;
+      }
+
+      if (pendingSourceCount > 0) {
+        return `${pendingSourceCount} 个源待播放验证`;
+      }
+
       return failedSourceCount > 0
         ? '测速完成，暂无可播放媒体样本'
         : '等待首播数据';
     }
 
-    if (hasManualTested) {
+    if (
+      sourceProbeProgress.total > 0 &&
+      sourceProbeProgress.done >= sourceProbeProgress.total
+    ) {
       return `已测速 ${testedSourceCount}/${availableSources.length}`;
     }
 
-    return '手动测速后按首播质量排序';
+    return '正在自动测速，完成后按首播质量排序';
   })();
 
   const getSourceStatusBadge = (
@@ -630,6 +515,29 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
       };
     }
 
+    if (videoInfo.status === 'partial') {
+      if (videoInfo.failureKind === 'resolver') {
+        return {
+          label: '待解析',
+          className: 'text-amber-600 dark:text-amber-300',
+        };
+      }
+
+      if (videoInfo.failureKind === 'timeout') {
+        return {
+          label: '待验证',
+          className: 'text-amber-600 dark:text-amber-300',
+        };
+      }
+
+      if (videoInfo.failureKind === 'manifest' && !videoInfo.playable) {
+        return {
+          label: '待验证',
+          className: 'text-amber-600 dark:text-amber-300',
+        };
+      }
+    }
+
     if (videoInfo.quality && videoInfo.quality !== '未知') {
       const isUltraHigh = ['4K', '2K'].includes(videoInfo.quality);
       const isHigh = ['1080p', '720p'].includes(videoInfo.quality);
@@ -643,9 +551,16 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
       };
     }
 
+    if (hasMeasuredMediaThroughput(videoInfo)) {
+      return {
+        label: '可播',
+        className: 'text-green-600 dark:text-green-400',
+      };
+    }
+
     if (videoInfo.status === 'partial' || videoInfo.pingTime > 0) {
       return {
-        label: '仅连通',
+        label: '已连通',
         className: 'text-sky-600 dark:text-sky-300',
       };
     }
@@ -845,17 +760,17 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                     <button
                       type='button'
                       onClick={handleManualSpeedTest}
-                      disabled={manualTesting}
+                      disabled={sourceProbeProgress.running}
                       className='inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-emerald-400/40 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-700 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-60 dark:text-emerald-200'
                       title='手动重新检测全部播放源'
                     >
                       <RefreshCw
                         className={`h-3.5 w-3.5 ${
-                          manualTesting ? 'animate-spin' : ''
+                          sourceProbeProgress.running ? 'animate-spin' : ''
                         }`}
                       />
-                      {manualTesting
-                        ? `${manualProgress.done}/${manualProgress.total}`
+                      {sourceProbeProgress.running
+                        ? `${sourceProbeProgress.done}/${sourceProbeProgress.total}`
                         : '手动测速'}
                     </button>
                   </div>
@@ -1017,14 +932,18 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                                             videoInfo.startupTimeMs,
                                           )} font-medium text-xs`}
                                         >
-                                          首片{' '}
+                                          延迟{' '}
                                           {formatResponseTime(
                                             videoInfo.startupTimeMs,
                                           )}
                                         </div>
                                       ) : videoInfo.pingTime > 0 ? (
-                                        <div className='text-orange-600 dark:text-orange-400 font-medium text-xs'>
-                                          仅响应{' '}
+                                        <div
+                                          className={`${getLatencyTextClassName(
+                                            videoInfo.pingTime,
+                                          )} font-medium text-xs`}
+                                        >
+                                          响应{' '}
                                           {formatResponseTime(
                                             videoInfo.pingTime,
                                           )}
@@ -1038,9 +957,22 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
                                         >
                                           速度 {videoInfo.loadSpeed}
                                         </div>
+                                      ) : videoInfo.message &&
+                                        (videoInfo.failureKind === 'resolver' ||
+                                          videoInfo.failureKind === 'timeout' ||
+                                          (videoInfo.failureKind ===
+                                            'manifest' &&
+                                            !videoInfo.playable) ||
+                                          !videoInfo.pingTime) ? (
+                                        <div
+                                          className='truncate text-amber-600 dark:text-amber-300 font-medium text-xs'
+                                          title={videoInfo.message}
+                                        >
+                                          {videoInfo.message}
+                                        </div>
                                       ) : (
-                                        <div className='text-gray-500 dark:text-gray-400 font-medium text-xs'>
-                                          未取得媒体分片
+                                        <div className='text-sky-600 dark:text-sky-300 font-medium text-xs'>
+                                          已连通，待分片测速
                                         </div>
                                       )}
                                     </div>
